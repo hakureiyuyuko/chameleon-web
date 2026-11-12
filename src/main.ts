@@ -143,6 +143,8 @@ function renderInfo (): void {
   const i = svc.info
   const parts: string[] = []
   if (svc.portLabel) parts.push(`端口 <b>${svc.portLabel}</b>`)
+  const modeBtn = $('#btn-mode')
+  if (modeBtn) modeBtn.textContent = i.mode === 'TAG' ? '切到 READER' : '切到 TAG'
   if (i.model) parts.push(`型号 <b>${i.model}</b>`)
   if (i.appVersion) parts.push(`固件 <b>${i.appVersion}</b>`)
   if (i.gitVersion) parts.push(`git <b>${i.gitVersion.slice(0, 7)}</b>`)
@@ -539,6 +541,12 @@ function bind (): void {
   $('#btn-connect').addEventListener('click', doConnect)
   $('#btn-disconnect').addEventListener('click', doDisconnect)
   $('#btn-save-slots').addEventListener('click', () => run('保存槽位设置', async () => { await svc.saveSlotSettings() }))
+  $('#btn-mode').addEventListener('click', () => run('切换模式', async () => {
+    const target = svc.info.mode === 'TAG' ? 'READER' : 'TAG'
+    await svc.setDeviceMode(target)
+    renderInfo(); renderSlots()
+    toast(target === 'TAG' ? '已切到 TAG（开始模拟卡）' : '已切回 READER（读卡模式）', 'ok')
+  }))
   $('#btn-write').addEventListener('click', doWrite)
   $('#btn-write-lf').addEventListener('click', doWriteLf)
 

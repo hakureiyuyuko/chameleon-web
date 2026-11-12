@@ -310,6 +310,13 @@ export class UltraService {
     this.info.mode = 'READER'
   }
 
+  /** 切读者/模拟模式：写完槽位要切到 TAG，设备才会去模拟卡 */
+  async setDeviceMode (mode: 'TAG' | 'READER'): Promise<void> {
+    await this.ultra.cmdChangeDeviceMode(mode === 'TAG' ? DeviceMode.TAG : DeviceMode.READER)
+    this.info.mode = mode
+    this.onLog(`设备模式 → ${mode === 'TAG' ? 'TAG（模拟卡）' : 'READER（读卡）'}`, 'ok')
+  }
+
   async scanHf (): Promise<CardScan[]> {
     await this.assureReader()
     const tags = await this.ultra.cmdHf14aScan()
