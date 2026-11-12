@@ -6,3 +6,6 @@ dev.log
 .idea/
 .DS_Store
 Thumbs.db
+
+tools/
+

@@ -98,9 +98,27 @@ export function sectorLayout (sector: number): [start: number, count: number] {
 
 /** 块数 → 最贴近的 MF1 容量类型 */
 export function mf1TagTypeOf (blockCount: number): TagType {
+  if (blockCount <= 20) return TagType.MIFARE_Mini
   if (blockCount <= 64) return TagType.MIFARE_1024
   if (blockCount <= 128) return TagType.MIFARE_2048
   return TagType.MIFARE_4096
+}
+
+export interface Mf1Geometry {
+  sectors: number
+  blocks: number
+}
+
+/**
+ * 由 SAK 推算卡片真实容量。
+ * 这一步很关键：固件 mf1_toolbox_check_keys_of_sectors() 固定遍历 40 个扇区，
+ * 不存在的扇区每次认证都失败，1K 卡多扫 24 个扇区会让整条命令拖上几分钟。
+ */
+export function mf1GeometryFromSak (sak?: string): Mf1Geometry {
+  const s = (parseInt(sak ?? '08', 16) || 0) & 0x7f
+  if (s === 0x18) return { sectors: 40, blocks: 256 } // Classic 4K
+  if (s === 0x09) return { sectors: 5, blocks: 20 }  // Classic Mini
+  return { sectors: 16, blocks: 64 }                  // 0x08 1K，0x10/0x11 Plus 同构
 }
 
 const hex = (b: Buffer | Uint8Array): string => Buffer.from(b).toString('hex').toUpperCase()
@@ -278,20 +296,41 @@ export class UltraService {
 
   /**
    * 用密钥字典读整张 Mifare Classic 卡。
-   * 先一次性做全扇区 key 检查（一条命令覆盖 40 个扇区），再逐块读。
+   * 关键：先扫一次拿到 SAK，按真实容量限定扇区数（maxSectors），否则固件会把不存在的扇区也拖一遍。
    */
-  async mf1ReadCard (keys: Buffer[], onProgress: ProgressFn = () => {}): Promise<Mf1Dump> {
+  async mf1ReadCard (
+    keys: Buffer[],
+    onProgress: ProgressFn = () => {},
+    opts: { scan?: CardScan | null, shouldCancel?: () => boolean } = {},
+  ): Promise<Mf1Dump> {
     const u = this.ultra
+    const { shouldCancel } = opts
+    const checkCancel = (): void => { if (shouldCancel?.()) throw new Error('已取消') }
     await this.assureReader()
-    onProgress('检测扇区密钥…', 5)
-    const found = await u.mf1CheckKeysOfSectors({ keys, maxSectors: 40 })
+
+    onProgress('扫描卡片确定容量…', 3)
+    const scan = opts.scan ?? (await this.scanHf())[0]
+    if (!scan) throw new Error('没扫到卡，把卡贴到天线上再试')
+    const geo = mf1GeometryFromSak(scan.sak)
+    this.onLog(`卡片：${scan.uid} SAK=${scan.sak} → ${geo.sectors} 扇区 / ${geo.blocks} 块`, 'info')
+    checkCancel()
+
+    onProgress(`检测密钥（${geo.sectors} 个扇区）…`, 6)
+    const found = await u.mf1CheckKeysOfSectors({
+      keys,
+      maxSectors: geo.sectors,
+      onChunkKeys: async ({ keys: chunk }) => {
+        this.onLog(`正在试 ${chunk.length} 个密钥…`, 'debug')
+        onProgress(`检测密钥（${geo.sectors} 个扇区，${chunk.length} 个候选）…`, 8)
+      },
+    })
+    checkCancel()
 
     const sectorKeys: Array<{ a?: Buffer, b?: Buffer }> = []
     let maxSector = -1
-    for (let s = 0; s < 40; s++) {
+    for (let s = 0; s < geo.sectors; s++) {
       const a = found[s * 2] ?? undefined
       const b = found[s * 2 + 1] ?? undefined
-      // 4096 卡只有 32 个 16 块扇区，多出来的槽位读不到属正常
       if (a || b) {
         sectorKeys[s] = { a, b }
         maxSector = Math.max(maxSector, s)
@@ -299,18 +338,18 @@ export class UltraService {
     }
     if (maxSector < 0) throw new Error('一个密钥都没命中，换更大的字典或先试 Gen1a 快读')
 
-    const sectorCount = maxSector >= 32 ? 40 : maxSector >= 16 ? 32 : 16
-    const blockCount = sectorCount < 32 ? 64 : sectorCount === 32 ? 128 : 256
-    const blocks: (string | null)[] = new Array(blockCount).fill(null)
+    const blocks: (string | null)[] = new Array(geo.blocks).fill(null)
     const keyMap: Mf1Dump['keys'] = {}
 
-    for (let s = 0; s < sectorCount; s++) {
+    for (let s = 0; s <= maxSector; s++) {
       const keysOfSector = sectorKeys[s]
       if (!keysOfSector) continue
       keyMap[s] = { a: keysOfSector.a ? hex(keysOfSector.a) : undefined, b: keysOfSector.b ? hex(keysOfSector.b) : undefined }
       const [start, count] = sectorLayout(s)
       for (let i = 0; i < count; i++) {
         const block = start + i
+        if (block >= geo.blocks) break
+        checkCancel()
         for (const keyType of [0x60, 0x61]) {
           const key = keyType === 0x60 ? keysOfSector.a : keysOfSector.b
           if (!key) continue
@@ -322,27 +361,33 @@ export class UltraService {
           }
         }
       }
-      onProgress(`读取扇区 ${s + 1}/${sectorCount}`, 5 + Math.round(((s + 1) / sectorCount) * 90))
+      onProgress(`读取扇区 ${s + 1}/${maxSector + 1}`, 10 + Math.round(((s + 1) / (maxSector + 1)) * 88))
     }
 
     const readCount = blocks.filter(b => b !== null).length
-    this.onLog(`读完：${readCount}/${blockCount} 块（${sectorCount} 扇区）`, 'ok')
+    this.onLog(`读完：${readCount}/${geo.blocks} 块（${maxSector + 1} 扇区）`, 'ok')
     return {
       kind: 'mf1',
-      tagType: mf1TagTypeOf(blockCount),
+      tagType: mf1TagTypeOf(geo.blocks),
       blocks,
       keys: keyMap,
+      scan,
       createdAt: new Date().toISOString(),
     }
   }
 
   /** Gen1a 后门卡（UID 卡/魔术卡）绕过密钥直接全卡读 */
-  async mf1Gen1aReadCard (onProgress: ProgressFn = () => {}): Promise<Mf1Dump> {
+  async mf1Gen1aReadCard (
+    onProgress: ProgressFn = () => {},
+    opts: { shouldCancel?: () => boolean } = {},
+  ): Promise<Mf1Dump> {
     const u = this.ultra
+    const checkCancel = (): void => { if (opts.shouldCancel?.()) throw new Error('已取消') }
     await this.assureReader()
     const blockCount = 256
     const blocks: (string | null)[] = new Array(blockCount).fill(null)
     for (let b = 0; b < blockCount; b++) {
+      checkCancel()
       try {
         blocks[b] = hex(await u.mf1Gen1aReadBlocks(b, 1))
       } catch (err: any) {

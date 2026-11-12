@@ -117,9 +117,11 @@ function refreshButtons (): void {
 }
 
 let busyGlobal = false
+let cancelRequested = false
 async function run<T> (label: string, fn: () => Promise<T>): Promise<T | undefined> {
   if (busyGlobal) return
   busyGlobal = true
+  cancelRequested = false
   refreshButtons()
   try {
     return await fn()
@@ -516,6 +518,10 @@ function renderKeys (): void {
 
 function bind (): void {
   $('#btn-theme').addEventListener('click', toggleTheme)
+  $('#btn-cancel').addEventListener('click', () => {
+    cancelRequested = true
+    addLog('已请求取消，当前命令结束后停止…', 'warn')
+  })
   $('#btn-connect').addEventListener('click', doConnect)
   $('#btn-disconnect').addEventListener('click', doDisconnect)
   $('#btn-save-slots').addEventListener('click', () => run('保存槽位设置', async () => { await svc.saveSlotSettings() }))
@@ -552,8 +558,7 @@ function bind (): void {
     const keys = keysFromInput()
     if (keys.length === 0) throw new Error('密钥字典是空的')
     setProgress('开始读取…', 2)
-    const dump = await svc.mf1ReadCard(keys, setProgress)
-    if (selectedScan) dump.scan = selectedScan
+    const dump = await svc.mf1ReadCard(keys, setProgress, { shouldCancel: () => cancelRequested })
     currentDump = dump
     renderDump()
     toast('读取完成', 'ok')
@@ -562,7 +567,7 @@ function bind (): void {
 
   $('#btn-read-gen1a').addEventListener('click', () => run('Gen1a 快读', async () => {
     setProgress('Gen1a 读取…', 2)
-    const dump = await svc.mf1Gen1aReadCard(setProgress)
+    const dump = await svc.mf1Gen1aReadCard(setProgress, { shouldCancel: () => cancelRequested })
     if (selectedScan) dump.scan = selectedScan
     currentDump = dump
     renderDump()
