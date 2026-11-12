@@ -568,7 +568,10 @@ function bind (): void {
     const keys = keysFromInput()
     if (keys.length === 0) throw new Error('密钥字典是空的')
     setProgress('开始读取…', 2)
-    const dump = await svc.mf1ReadCard(keys, setProgress, { shouldCancel: () => cancelRequested })
+    const dump = await svc.mf1ReadCard(keys, setProgress, {
+      shouldCancel: () => cancelRequested,
+      bruteKeyB: ($('#chk-brute-b') as HTMLInputElement).checked,
+    })
     currentDump = dump
     renderDump()
     toast('读取完成', 'ok')

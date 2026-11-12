@@ -331,7 +331,7 @@ export class UltraService {
   async mf1ReadCard (
     keys: Buffer[],
     onProgress: ProgressFn = () => {},
-    opts: { scan?: CardScan | null, shouldCancel?: () => boolean } = {},
+    opts: { scan?: CardScan | null, shouldCancel?: () => boolean, bruteKeyB?: boolean } = {},
   ): Promise<Mf1Dump> {
     const u = this.ultra
     const { shouldCancel } = opts
@@ -366,18 +366,47 @@ export class UltraService {
     let sectorsOk = 0
 
     const findKey = async (block: number, keyType: number): Promise<Buffer | null> => {
-      // MF1_CHECK_KEYS_ON_BLOCK 单次最多 (512-3)/6 = 84 个密钥，字典大了要分块
-      const MAX_KEYS = 80
+      // 实测：固件在“这组密钥都不对”时返回的是错误状态（HF tag auth failed），
+      // 所以任何异常都要当作“没命中”继续，而不是直接放弃。
+      const MAX_KEYS = 80 // MF1_CHECK_KEYS_ON_BLOCK 单次上限 (512-3)/6 = 84
       for (let i = 0; i < keys.length; i += MAX_KEYS) {
         const chunk = keys.slice(i, i + MAX_KEYS)
-        try {
-          const found = await u.cmdMf1CheckKeysOfBlock({ block, keyType: keyType as any, keys: chunk })
-          if (found && found.length >= 6) return Buffer.from(found.subarray(0, 6))
-        } catch (err: any) {
-          if (!u.isConnected()) throw err
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const found = await u.cmdMf1CheckKeysOfBlock({ block, keyType: keyType as any, keys: chunk })
+            if (found && found.length >= 6) return Buffer.from(found.subarray(0, 6))
+            break
+          } catch (err: any) {
+            if (!u.isConnected()) throw err
+            const msg = String(err?.message ?? err)
+            if (/not found|no tag/i.test(msg) && attempt === 0) {
+              this.onLog(`块 ${block} 认证时丢场，重试一次`, 'debug')
+              continue
+            }
+            break // auth failed = 这组密钥没命中，继续下一组 / 下一个 keyType
+          }
         }
       }
       return null
+    }
+
+    // 认证失败后卡偶尔丢场，读块也要带一次重试
+    const readBlock = async (block: number, keyType: number, key: Buffer): Promise<Buffer | null> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          return await u.cmdMf1ReadBlock({ block, keyType: keyType as any, key })
+        } catch (err: any) {
+          if (!u.isConnected()) throw err
+          if (attempt === 0) continue
+        }
+      }
+      return null
+    }
+
+    const nonZeroKey = (buf: Buffer | null | undefined): Buffer | null => {
+      if (!buf || buf.length < 6) return null
+      const key = Buffer.from(buf.subarray(0, 6))
+      return key.every((x: number) => x === 0) ? null : key
     }
 
     for (let s = 0; s < geo.sectors; s++) {
@@ -388,15 +417,20 @@ export class UltraService {
       onProgress(`扇区 ${s + 1}/${geo.sectors}：找密钥…`, 6 + Math.round((s / geo.sectors) * 84))
       let keyA = await findKey(trailer, 0x60)
       let keyB: Buffer | null = null
+
       if (keyA) {
-        // 已经能读 trailer 了，直接从尾块取 key B，省一次爆破
-        try {
-          const t = await u.cmdMf1ReadBlock({ block: trailer, keyType: 0x60 as any, key: keyA })
-          keyB = Buffer.from(t.subarray(10, 16))
-          if (keyB.every((x: number) => x === 0)) keyB = null
-        } catch {}
+        // 能用 KEY_A 读尾块就直接取 KEY_B（传输配置的卡可读，普通卡返回 00）
+        const t = await readBlock(trailer, 0x60, keyA)
+        keyB = nonZeroKey(t?.subarray(10, 16))
+        // 完整克隆时才去硬碰 KEY_B（慢，默认关）
+        if (!keyB && opts.bruteKeyB) keyB = await findKey(trailer, 0x61)
       } else {
         keyB = await findKey(trailer, 0x61)
+        if (keyB) {
+          // 反过来：能读尾块就能拿到 KEY_A
+          const t = await readBlock(trailer, 0x61, keyB)
+          keyA = nonZeroKey(t?.subarray(0, 6))
+        }
       }
       if (!keyA && !keyB) continue
 
@@ -410,13 +444,24 @@ export class UltraService {
         checkCancel()
         for (const [keyType, key] of [[0x60, keyA], [0x61, keyB]] as const) {
           if (!key) continue
-          try {
-            blocks[block] = hex(await u.cmdMf1ReadBlock({ block, keyType: keyType as any, key }))
-            break
-          } catch (err: any) {
-            if (!u.isConnected()) throw err
-          }
+          const data = await readBlock(block, keyType, key)
+          if (data) { blocks[block] = hex(data); break }
         }
+      }
+
+      // 把已知密钥回填到尾块的 16 字节里：
+      // 标准卡尾块的 KEY_B 空中永远读回 00，不回填的话 dump 写进模拟槽后密钥就丢了。
+      const trailerHex = blocks[trailer]
+      if (trailerHex) {
+        const bytes = (trailerHex.match(/.{2}/g) ?? []).slice(0, 16)
+        const put = (offset: number, key: Buffer | null): void => {
+          if (!key || key.length !== 6) return
+          const hexes = hex(key).match(/.{2}/g) ?? []
+          for (let i = 0; i < 6; i++) bytes[offset + i] = hexes[i]
+        }
+        put(0, keyA)
+        put(10, keyB)
+        blocks[trailer] = bytes.join('')
       }
     }
 
