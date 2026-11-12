@@ -521,6 +521,16 @@ function bind (): void {
   $('#btn-cancel').addEventListener('click', () => {
     cancelRequested = true
     addLog('已请求取消，当前命令结束后停止…', 'warn')
+    if (busyGlobal) {
+      // 单条串口命令是没法中途打断的，所以给个后手：4 秒后还没退出就拔电
+      setTimeout(async () => {
+        if (!busyGlobal) return
+        addLog('命令无响应，强制断开串口（重新连接即可继续）', 'err')
+        toast('已强制断开', 'err')
+        await svc.disconnect().catch(() => {})
+        renderInfo(); renderSlots()
+      }, 4000)
+    }
   })
   $('#btn-connect').addEventListener('click', doConnect)
   $('#btn-disconnect').addEventListener('click', doDisconnect)

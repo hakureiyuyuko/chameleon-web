@@ -141,6 +141,18 @@ export class UltraService {
     this.ultra.emitter.on('debug', (name: string, fmt: any, ...args: any[]) => {
       this.onLog(`[${name}] ${typeof fmt === 'string' ? fmt : JSON.stringify(fmt)} ${args.length ? JSON.stringify(args) : ''}`.trim(), 'debug')
     })
+    // 帧级打点：每条响应都记下 cmd / 状态 / 长度，卡在哪个命令上一目了然
+    this.ultra.emitter.on('resp', (frame: any) => {
+      try {
+        this.onLog(`← cmd ${frame.cmd} status ${frame.status} len ${frame.data?.length ?? 0}`, 'debug')
+      } catch {}
+    })
+    this.ultra.emitter.on('disconnected', (at: Date, reason?: string) => {
+      this.onLog(`串口读循环结束${reason ? `：${reason}` : ''}`, reason ? 'err' : 'warn')
+    })
+    this.ultra.emitter.on('error', (err: Error) => {
+      this.onLog(`SDK 错误：${err?.message ?? err}`, 'err')
+    })
     await this.ultra.use(new WebserialAdapter())
   }
 
@@ -153,15 +165,33 @@ export class UltraService {
   }
 
   /**
-   * SDK 的 WebserialAdapter 里 requestPort 带了 VID/PID 过滤器（6868:8686），
-   * 某些板子/改过 PID 的机器在选口对话框里会看不到。这里包一层忽略 filters，
-   * 让浏览器列出系统全部串口（比如 COM38），由你手选。
+   * 两层修正：
+   * 1. SDK 的 WebserialAdapter 里 requestPort 带了 VID/PID 过滤器（6868:8686），
+   *    某些板子/改过 PID 的机器在选口对话框里会看不到。这里包一层忽略 filters。
+   * 2. Chrome Web Serial 的 open() 不传 bufferSize 时默认只有 255 字节，
+   *    而 Ultra 有些命令（如 MF1 批量查密钥）的响应接近 500 字节，容易大包被截断。
+   *    这里统一把收发缓冲扩到 4KB。
    */
   #patchPortChooser (): void {
     const serial: any = (navigator as any).serial
     if (!serial || serial.__chatboxPatched) return
     const orig = serial.requestPort.bind(serial)
-    serial.requestPort = async () => await orig()
+    serial.requestPort = async () => {
+      const port = await orig()
+      if (port && !port.__buffered) {
+        const origOpen = port.open.bind(port)
+        port.open = async (opts: any = {}) => {
+          try {
+            return await origOpen({ bufferSize: 4096, ...opts })
+          } catch (err) {
+            this.onLog(`bufferSize 设置失败，回退默认值：${(err as Error)?.message}`, 'warn')
+            return await origOpen(opts)
+          }
+        }
+        port.__buffered = true
+      }
+      return port
+    }
     serial.__chatboxPatched = true
   }
 
@@ -315,43 +345,70 @@ export class UltraService {
     this.onLog(`卡片：${scan.uid} SAK=${scan.sak} → ${geo.sectors} 扇区 / ${geo.blocks} 块`, 'info')
     checkCancel()
 
-    onProgress(`检测密钥（${geo.sectors} 个扇区）…`, 6)
-    const found = await u.mf1CheckKeysOfSectors({
-      keys,
-      maxSectors: geo.sectors,
-      onChunkKeys: async ({ keys: chunk }) => {
-        this.onLog(`正在试 ${chunk.length} 个密钥…`, 'debug')
-        onProgress(`检测密钥（${geo.sectors} 个扇区，${chunk.length} 个候选）…`, 8)
-      },
-    })
+    // 预检：SAK 不像 Classic 时，先让设备自己判断一下，避免白白做几十次认证
+    const sakByte = (parseInt(scan.sak || '00', 16) || 0) & 0x7f
+    const looksMf1 = sakByte === 0x08 || sakByte === 0x09 || sakByte === 0x18
+    if (!looksMf1) {
+      onProgress('预检：确认是不是 MIFARE Classic…', 5)
+      const ok = await u.cmdMf1IsSupport().catch(() => false)
+      if (!ok) {
+        throw new Error(`这张卡不是 MIFARE Classic（SAK=0x${sakByte.toString(16).padStart(2, '0')}），MIFARE 认证不可能成功。请改用「读取 MF0/NTAG」，或先 HF 扫描看卡型`)
+      }
+      this.onLog('SAK 不像 Classic，但设备预检通过，继续尝试', 'warn')
+    }
     checkCancel()
 
-    const sectorKeys: Array<{ a?: Buffer, b?: Buffer }> = []
-    let maxSector = -1
-    for (let s = 0; s < geo.sectors; s++) {
-      const a = found[s * 2] ?? undefined
-      const b = found[s * 2 + 1] ?? undefined
-      if (a || b) {
-        sectorKeys[s] = { a, b }
-        maxSector = Math.max(maxSector, s)
-      }
-    }
-    if (maxSector < 0) throw new Error('一个密钥都没命中，换更大的字典或先试 Gen1a 快读')
-
+    // 逐扇区检查密钥：用 MF1_CHECK_KEYS_ON_BLOCK(2015)，响应只有几个字节。
+    // 不用 mf1CheckKeysOfSectors(2012) 是因为它的响应固定 490 字节，
+    // Chrome Web Serial 默认 bufferSize=255，大包容易被截断导致读循环永远等不到完整帧。
     const blocks: (string | null)[] = new Array(geo.blocks).fill(null)
     const keyMap: Mf1Dump['keys'] = {}
+    let sectorsOk = 0
 
-    for (let s = 0; s <= maxSector; s++) {
-      const keysOfSector = sectorKeys[s]
-      if (!keysOfSector) continue
-      keyMap[s] = { a: keysOfSector.a ? hex(keysOfSector.a) : undefined, b: keysOfSector.b ? hex(keysOfSector.b) : undefined }
+    const findKey = async (block: number, keyType: number): Promise<Buffer | null> => {
+      // MF1_CHECK_KEYS_ON_BLOCK 单次最多 (512-3)/6 = 84 个密钥，字典大了要分块
+      const MAX_KEYS = 80
+      for (let i = 0; i < keys.length; i += MAX_KEYS) {
+        const chunk = keys.slice(i, i + MAX_KEYS)
+        try {
+          const found = await u.cmdMf1CheckKeysOfBlock({ block, keyType: keyType as any, keys: chunk })
+          if (found && found.length >= 6) return Buffer.from(found.subarray(0, 6))
+        } catch (err: any) {
+          if (!u.isConnected()) throw err
+        }
+      }
+      return null
+    }
+
+    for (let s = 0; s < geo.sectors; s++) {
+      checkCancel()
       const [start, count] = sectorLayout(s)
+      const trailer = Math.min(start + count - 1, geo.blocks - 1)
+
+      onProgress(`扇区 ${s + 1}/${geo.sectors}：找密钥…`, 6 + Math.round((s / geo.sectors) * 84))
+      let keyA = await findKey(trailer, 0x60)
+      let keyB: Buffer | null = null
+      if (keyA) {
+        // 已经能读 trailer 了，直接从尾块取 key B，省一次爆破
+        try {
+          const t = await u.cmdMf1ReadBlock({ block: trailer, keyType: 0x60 as any, key: keyA })
+          keyB = Buffer.from(t.subarray(10, 16))
+          if (keyB.every((x: number) => x === 0)) keyB = null
+        } catch {}
+      } else {
+        keyB = await findKey(trailer, 0x61)
+      }
+      if (!keyA && !keyB) continue
+
+      sectorsOk++
+      keyMap[s] = { a: keyA ? hex(keyA) : undefined, b: keyB ? hex(keyB) : undefined }
+      this.onLog(`扇区 ${s}: KEY_A=${keyA ? hex(keyA) : '—'} KEY_B=${keyB ? hex(keyB) : '—'}`, 'debug')
+
       for (let i = 0; i < count; i++) {
         const block = start + i
         if (block >= geo.blocks) break
         checkCancel()
-        for (const keyType of [0x60, 0x61]) {
-          const key = keyType === 0x60 ? keysOfSector.a : keysOfSector.b
+        for (const [keyType, key] of [[0x60, keyA], [0x61, keyB]] as const) {
           if (!key) continue
           try {
             blocks[block] = hex(await u.cmdMf1ReadBlock({ block, keyType: keyType as any, key }))
@@ -361,11 +418,12 @@ export class UltraService {
           }
         }
       }
-      onProgress(`读取扇区 ${s + 1}/${maxSector + 1}`, 10 + Math.round(((s + 1) / (maxSector + 1)) * 88))
     }
 
+    if (sectorsOk === 0) throw new Error('一个密钥都没命中，换更大的字典或先试 Gen1a 快读')
+
     const readCount = blocks.filter(b => b !== null).length
-    this.onLog(`读完：${readCount}/${geo.blocks} 块（${maxSector + 1} 扇区）`, 'ok')
+    this.onLog(`读完：${readCount}/${geo.blocks} 块（${sectorsOk}/${geo.sectors} 扇区有密钥）`, 'ok')
     return {
       kind: 'mf1',
       tagType: mf1TagTypeOf(geo.blocks),

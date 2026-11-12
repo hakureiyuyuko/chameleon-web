@@ -56,6 +56,10 @@ Windows 上也可以直接双击 `start.cmd`：没有 `dist/` 会先构建，然
 3. **端口过滤器被绕过了。** SDK 的 `WebserialAdapter` 内部写死 `requestPort({filters: [6868:8686]})`，改过 PID 的板子会看不到，所以这里包了一层忽略 filters。
 4. **串口只能由用户手势触发，且只能选已授权的口。** 浏览器里没有"自动扫描 COM 号"这回事，`navigator.serial.getPorts()` 只能拿到之前授权过的端口。
 5. **串口独占。** CLI / 桌面版 GUI 开着同一个 COM 口时，浏览器会报 `Failed to open serial port`。
+6. **Chrome Web Serial 的 `open()` 默认 `bufferSize` 只有 255 字节。** Ultra 的 `MF1_CHECK_KEYS_OF_SECTORS`(2012) 响应固定 490 字节，是整条流程里第一个超过 255 的帧，大包容易被截断，导致 SDK 读循环永远凑不出完整帧（表现为“检测密钥”永久卡住、且没有报错）。现在的做法：
+   - `port.open()` 统一传 `bufferSize: 4096`（在 `requestPort` 外面包一层）
+   - 密钥检查改用 `MF1_CHECK_KEYS_ON_BLOCK`(2015)，逐扇区问，响应只有几个字节
+   - 读循环加了帧级日志（`← cmd X status Y len Z`），卡在哪个命令上直接能看出来
 
 ## 已知限制
 
