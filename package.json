@@ -1,0 +1,35 @@
+{
+  "name": "chameleon-ultra-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "description": "Chameleon Ultra 的纯前端网页版 GUI（Web Serial / Web Bluetooth），无需安装客户端",
+  "homepage": "https://hakureiyuyuko.github.io/chameleon-web/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hakureiyuyuko/chameleon-web.git"
+  },
+  "keywords": [
+    "chameleon-ultra",
+    "nfc",
+    "rfid",
+    "web-serial",
+    "mifare",
+    "em410x"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "serve": "node serve.mjs 8080"
+  },
+  "dependencies": {
+    "chameleon-ultra.js": "^0.4.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12"
+  }
+}

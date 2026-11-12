@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Chameleon Ultra 的纯前端网页版 GUI：浏览器通过 Web Serial 直连设备串口，无需安装客户端。" />
+  <title>Chameleon Ultra · Web</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232f81f7' stroke-width='4'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%232f81f7'/%3E%3C/svg%3E" />
+  <script>
+    // 尽早定主题，避免白/黑闪一下
+    try {
+      var t = localStorage.getItem('cu.theme');
+      if (t !== 'light' && t !== 'dark') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+      document.documentElement.dataset.theme = t;
+    } catch (e) { document.documentElement.dataset.theme = 'dark'; }
+  </script>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="status-dot"></span>
+      <strong>Chameleon&nbsp;Ultra</strong>
+      <span class="muted" id="conn-state">未连接</span>
+    </div>
+    <div class="actions">
+      <button id="btn-theme" class="icon ghost" title="切换日间/夜间模式" aria-label="切换主题">☾</button>
+      <button id="btn-connect" class="primary">连接设备</button>
+      <button id="btn-disconnect" class="ghost" disabled>断开</button>
+    </div>
+  </header>
+
+  <div id="dev-info" class="info-strip"></div>
+
+  <main>
+    <aside class="panel slots">
+      <div class="panel-head">
+        <h2>槽位</h2>
+        <button id="btn-save-slots" class="mini">保存到设备</button>
+      </div>
+      <div id="slots" class="slot-list">
+        <p class="muted small">连接后显示 8 个槽位</p>
+      </div>
+    </aside>
+
+    <section class="panel work">
+      <nav class="tabs">
+        <button data-tab="read" class="active">读卡</button>
+        <button data-tab="write">写入槽位</button>
+        <button data-tab="keys">密钥字典</button>
+        <button data-tab="log">日志</button>
+      </nav>
+
+      <div class="tab-body" data-tab="read">
+        <div class="row">
+          <button id="btn-scan" class="primary" disabled>HF 扫描</button>
+          <button id="btn-read-mf1" class="ghost" disabled>读取 MF1 整卡</button>
+          <button id="btn-read-gen1a" class="ghost" disabled>Gen1a 快读</button>
+          <button id="btn-read-mfu" class="ghost" disabled>读取 MF0/NTAG</button>
+          <button id="btn-lf-scan" class="ghost" disabled>LF 扫描</button>
+        </div>
+        <div id="progress-wrap" class="progress-wrap hidden">
+          <div class="progress"><i id="progress-bar"></i></div>
+          <span id="progress-text" class="muted small"></span>
+        </div>
+        <div id="scan-result"></div>
+        <div id="lf-result"></div>
+        <div id="dump-view"></div>
+      </div>
+
+      <div class="tab-body hidden" data-tab="write">
+        <div class="form">
+          <label>目标槽位
+            <select id="write-slot"></select>
+          </label>
+          <label id="mfu-type-wrap" class="hidden">MF0 类型
+            <select id="write-mfu-type"></select>
+          </label>
+          <button id="btn-write" class="primary" disabled>把当前 dump 写入槽位</button>
+          <button id="btn-write-lf" class="ghost" disabled>把选中的 LF 卡写入槽位</button>
+        </div>
+        <p class="muted small">
+          写入流程：切槽 → 改 tag type → 清空该类型数据 → 逐块写 → 写 UID/ATQA/SAK → 保存。
+          写入的卡不会自动激活为读卡模式，需要把设备切到 TAG 模式才会被外部读卡器识别。
+        </p>
+        <div id="write-result"></div>
+      </div>
+
+      <div class="tab-body hidden" data-tab="keys">
+        <div class="row">
+          <button id="btn-keys-save" class="ghost">保存字典</button>
+          <button id="btn-keys-reset" class="ghost">恢复默认</button>
+          <span class="muted small" id="keys-count"></span>
+        </div>
+        <textarea id="keys-input" spellcheck="false" placeholder="每行一个 12 位 hex 密钥"></textarea>
+      </div>
+
+      <div class="tab-body hidden" data-tab="log">
+        <div class="row">
+          <button id="btn-log-clear" class="ghost">清空</button>
+          <button id="btn-log-copy" class="ghost">复制日志</button>
+          <label class="muted small"><input type="checkbox" id="chk-debug" /> 显示 SDK 调试日志</label>
+        </div>
+        <pre id="log"></pre>
+      </div>
+    </section>
+  </main>
+
+  <input type="file" id="file-import" accept=".json,.bin,.dump" hidden />
+  <div id="toast" class="toast"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

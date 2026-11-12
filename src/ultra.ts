@@ -1,0 +1,557 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 三月七酱 <hakureiyuyuko>
+
+/**
+ * Chameleon Ultra 服务层：把 chameleon-ultra.js SDK 包一层，供 UI 调用。
+ * 传输层用 Web Serial（USB CDC 虚拟串口，115200 8N1）。
+ */
+import {
+  Buffer,
+  ChameleonUltra,
+  DeviceMode,
+  DeviceModel,
+  FreqType,
+  Slot,
+  TagType,
+} from 'chameleon-ultra.js'
+import WebserialAdapter from 'chameleon-ultra.js/plugin/WebserialAdapter'
+
+export type LogKind = 'info' | 'ok' | 'warn' | 'err' | 'debug'
+export type LogFn = (msg: string, kind?: LogKind) => void
+export type ProgressFn = (msg: string, pct: number) => void
+
+export interface CardScan {
+  uid: string
+  atqa: string
+  sak: string
+  ats: string
+}
+
+export interface DeviceInfo {
+  model?: string
+  appVersion?: string
+  gitVersion?: string
+  chipId?: string
+  battery?: { voltage: number, level: number }
+  mode?: string
+  activeSlot?: number
+}
+
+export interface SlotInfo {
+  slot: number
+  hfTagType: TagType
+  lfTagType: TagType
+  hfName?: string
+  lfName?: string
+  hfEnabled: boolean
+  lfEnabled: boolean
+}
+
+export interface LfScan {
+  /** em410x / hidprox / viking */
+  kind: 'em410x' | 'hidprox' | 'viking'
+  type: string
+  tagType: TagType
+  /** 可读 ID（hex 或 "FC x / CN y"） */
+  id: string
+  /** 原始数据，写槽位时用 */
+  raw?: any
+}
+
+export interface Mf1Dump {
+  kind: 'mf1'
+  tagType: TagType
+  /** 每个元素 32 个 hex 字符，读失败为 null */
+  blocks: (string | null)[]
+  keys: Record<number, { a?: string, b?: string }>
+  scan?: CardScan
+  createdAt: string
+}
+
+export interface MfuDump {
+  kind: 'mfu'
+  tagType: TagType
+  /** 连续 4 字节页数据 */
+  data: string
+  scan?: CardScan
+  createdAt: string
+}
+
+export type Dump = Mf1Dump | MfuDump
+
+export const SLOT_COUNT = 8
+
+/** 把串口层的报错换成能直接操作的中文提示 */
+function friendlySerialError (msg: string): string {
+  if (/No port selected by the user/i.test(msg)) return '你取消了端口选择，再点一次「连接设备」并选 COM38'
+  if (/Failed to open serial port|Access denied|Permission denied|Failed to execute 'open'/i.test(msg)) {
+    return `${msg} —— 这个串口被占用了，先关掉 chameleon-cli、桌面版 GUI 或其他串口工具`
+  }
+  if (/device has been lost|disconnected/i.test(msg)) return `${msg} —— 设备掉线，重新插拔 USB 后再连接`
+  return msg
+}
+
+/** Mifare Classic 扇区 → 起始块 / 块数 */
+export function sectorLayout (sector: number): [start: number, count: number] {
+  return sector < 32 ? [sector * 4, 4] : [128 + (sector - 32) * 16, 16]
+}
+
+/** 块数 → 最贴近的 MF1 容量类型 */
+export function mf1TagTypeOf (blockCount: number): TagType {
+  if (blockCount <= 64) return TagType.MIFARE_1024
+  if (blockCount <= 128) return TagType.MIFARE_2048
+  return TagType.MIFARE_4096
+}
+
+const hex = (b: Buffer | Uint8Array): string => Buffer.from(b).toString('hex').toUpperCase()
+
+export class UltraService {
+  ultra = new ChameleonUltra()
+  info: DeviceInfo = {}
+  slots: SlotInfo[] = []
+  onLog: LogFn = () => {}
+
+  #initPromise?: Promise<void>
+
+  /** 幂等初始化：装载 Web Serial 适配器 + 日志钩子 */
+  async ensureInit (): Promise<void> {
+    if (!this.#initPromise) this.#initPromise = this.init()
+    await this.#initPromise
+  }
+
+  async init (): Promise<void> {
+    this.ultra.emitter.on('debug', (name: string, fmt: any, ...args: any[]) => {
+      this.onLog(`[${name}] ${typeof fmt === 'string' ? fmt : JSON.stringify(fmt)} ${args.length ? JSON.stringify(args) : ''}`.trim(), 'debug')
+    })
+    await this.ultra.use(new WebserialAdapter())
+  }
+
+  isSupported (): boolean {
+    return !!(navigator as any).serial || ('usb' in navigator)
+  }
+
+  isConnected (): boolean {
+    return this.ultra.isConnected()
+  }
+
+  /**
+   * SDK 的 WebserialAdapter 里 requestPort 带了 VID/PID 过滤器（6868:8686），
+   * 某些板子/改过 PID 的机器在选口对话框里会看不到。这里包一层忽略 filters，
+   * 让浏览器列出系统全部串口（比如 COM38），由你手选。
+   */
+  #patchPortChooser (): void {
+    const serial: any = (navigator as any).serial
+    if (!serial || serial.__chatboxPatched) return
+    const orig = serial.requestPort.bind(serial)
+    serial.requestPort = async () => await orig()
+    serial.__chatboxPatched = true
+  }
+
+  async connect (): Promise<DeviceInfo> {
+    await this.ensureInit()
+    this.#patchPortChooser()
+    this.onLog('打开串口选择框…', 'info')
+    try {
+      await this.ultra.connect()
+    } catch (err: any) {
+      throw new Error(friendlySerialError(err?.message ?? String(err)))
+    }
+    this.onLog('串口已打开', 'ok')
+    this.info = await this.readInfo()
+    this.slots = await this.readSlots()
+    return this.info
+  }
+
+  async disconnect (): Promise<void> {
+    await this.ultra.disconnect().catch(() => {})
+    this.info = {}
+    this.slots = []
+    this.onLog('已断开', 'info')
+  }
+
+  async readInfo (): Promise<DeviceInfo> {
+    const u = this.ultra
+    const out: DeviceInfo = {}
+    const tryGet = async <T>(fn: () => Promise<T>, name: string): Promise<T | undefined> => {
+      try {
+        return await fn()
+      } catch (err: any) {
+        this.onLog(`${name} 读取失败：${err?.message ?? err}`, 'debug')
+        return undefined
+      }
+    }
+    const model = await tryGet(() => u.cmdGetDeviceModel(), '型号')
+    if (model !== undefined) out.model = DeviceModel[model] ?? String(model)
+    out.appVersion = await tryGet(() => u.cmdGetAppVersion(), '固件版本')
+    out.gitVersion = await tryGet(() => u.cmdGetGitVersion(), 'git 版本')
+    out.chipId = await tryGet(() => u.cmdGetDeviceChipId(), '芯片 ID')
+    out.battery = await tryGet(() => u.cmdGetBatteryInfo(), '电量')
+    const mode = await tryGet(() => u.cmdGetDeviceMode(), '当前模式')
+    if (mode !== undefined) out.mode = DeviceMode[mode] ?? String(mode)
+    const slot = await tryGet(() => u.cmdSlotGetActive(), '激活槽位')
+    if (slot !== undefined) out.activeSlot = slot
+    return out
+  }
+
+  async readSlots (): Promise<SlotInfo[]> {
+    const u = this.ultra
+    const [infos, enabled, names] = await (async () => {
+      const a = await u.cmdSlotGetInfo()
+      const b = await u.cmdSlotGetIsEnable()
+      const c = await u.cmdSlotGetFreqNames().catch(() => [])
+      return [a, b, c] as const
+    })()
+    return Array.from({ length: SLOT_COUNT }, (_, i) => ({
+      slot: i,
+      hfTagType: infos[i]?.hfTagType ?? TagType.UNDEFINED,
+      lfTagType: infos[i]?.lfTagType ?? TagType.UNDEFINED,
+      hfName: (names as any)?.[i]?.[FreqType.HF] ?? undefined,
+      lfName: (names as any)?.[i]?.[FreqType.LF] ?? undefined,
+      hfEnabled: !!enabled[i]?.hf,
+      lfEnabled: !!enabled[i]?.lf,
+    }))
+  }
+
+  async setActiveSlot (slot: number): Promise<void> {
+    await this.ultra.cmdSlotSetActive(slot as Slot)
+    this.info.activeSlot = slot
+    this.onLog(`激活槽位 ${slot + 1}`, 'ok')
+  }
+
+  async setSlotTagType (slot: number, tagType: TagType): Promise<void> {
+    await this.ultra.cmdSlotChangeTagType(slot as Slot, tagType)
+    this.onLog(`槽位 ${slot + 1} 类型 → ${TagType[tagType]}`, 'ok')
+    this.slots = await this.readSlots()
+  }
+
+  /** @deprecated 用 setSlotTagType，tagType 自己决定是 HF 还是 LF */
+  async setSlotHfTagType (slot: number, tagType: TagType): Promise<void> {
+    await this.setSlotTagType(slot, tagType)
+  }
+
+  async setSlotEnable (slot: number, freq: FreqType, enable: boolean): Promise<void> {
+    await this.ultra.cmdSlotSetEnable(slot as Slot, freq, enable)
+    this.slots = await this.readSlots()
+  }
+
+  async setSlotName (slot: number, freq: FreqType, name: string): Promise<void> {
+    await this.ultra.cmdSlotSetFreqName(slot as Slot, freq, name)
+    this.slots = await this.readSlots()
+  }
+
+  async saveSlotSettings (): Promise<void> {
+    await this.ultra.cmdSlotSaveSettings()
+    this.onLog('槽位设置已保存到设备', 'ok')
+  }
+
+  async assureReader (): Promise<void> {
+    await this.ultra.assureDeviceMode(DeviceMode.READER)
+    this.info.mode = 'READER'
+  }
+
+  async scanHf (): Promise<CardScan[]> {
+    await this.assureReader()
+    const tags = await this.ultra.cmdHf14aScan()
+    return tags.map(t => ({
+      uid: hex(t.uid),
+      atqa: hex(t.atqa),
+      sak: hex(t.sak),
+      ats: hex(t.ats ?? Buffer.alloc(0)),
+    }))
+  }
+
+  /** SAK → 猜测卡片类型 */
+  static guessCardType (scan: CardScan): string {
+    const sak = (parseInt(scan.sak || '0', 16) || 0) & 0x7f
+    const uidLen = scan.uid.length / 2
+    if (scan.atqa === '0044' && sak === 0x00) return 'Mifare Ultralight / NTAG (MF0)'
+    if (sak === 0x00 && scan.atqa === '4403') return 'Mifare Ultralight C'
+    if (sak === 0x08) return 'Mifare Classic 1K'
+    if (sak === 0x18) return 'Mifare Classic 4K'
+    if (sak === 0x09) return 'Mifare Mini'
+    if (sak === 0x10 || sak === 0x11) return 'Mifare Plus'
+    if (sak === 0x20) return 'ISO 14443-4 (DESFire/JCOP)'
+    if (sak === 0x28) return 'SmartMX / JCOP'
+    if (uidLen === 7) return `ISO14443-4 卡（7 字节 UID, SAK ${scan.sak}）`
+    return `未知类型（SAK ${scan.sak}）`
+  }
+
+  /**
+   * 用密钥字典读整张 Mifare Classic 卡。
+   * 先一次性做全扇区 key 检查（一条命令覆盖 40 个扇区），再逐块读。
+   */
+  async mf1ReadCard (keys: Buffer[], onProgress: ProgressFn = () => {}): Promise<Mf1Dump> {
+    const u = this.ultra
+    await this.assureReader()
+    onProgress('检测扇区密钥…', 5)
+    const found = await u.mf1CheckKeysOfSectors({ keys, maxSectors: 40 })
+
+    const sectorKeys: Array<{ a?: Buffer, b?: Buffer }> = []
+    let maxSector = -1
+    for (let s = 0; s < 40; s++) {
+      const a = found[s * 2] ?? undefined
+      const b = found[s * 2 + 1] ?? undefined
+      // 4096 卡只有 32 个 16 块扇区，多出来的槽位读不到属正常
+      if (a || b) {
+        sectorKeys[s] = { a, b }
+        maxSector = Math.max(maxSector, s)
+      }
+    }
+    if (maxSector < 0) throw new Error('一个密钥都没命中，换更大的字典或先试 Gen1a 快读')
+
+    const sectorCount = maxSector >= 32 ? 40 : maxSector >= 16 ? 32 : 16
+    const blockCount = sectorCount < 32 ? 64 : sectorCount === 32 ? 128 : 256
+    const blocks: (string | null)[] = new Array(blockCount).fill(null)
+    const keyMap: Mf1Dump['keys'] = {}
+
+    for (let s = 0; s < sectorCount; s++) {
+      const keysOfSector = sectorKeys[s]
+      if (!keysOfSector) continue
+      keyMap[s] = { a: keysOfSector.a ? hex(keysOfSector.a) : undefined, b: keysOfSector.b ? hex(keysOfSector.b) : undefined }
+      const [start, count] = sectorLayout(s)
+      for (let i = 0; i < count; i++) {
+        const block = start + i
+        for (const keyType of [0x60, 0x61]) {
+          const key = keyType === 0x60 ? keysOfSector.a : keysOfSector.b
+          if (!key) continue
+          try {
+            blocks[block] = hex(await u.cmdMf1ReadBlock({ block, keyType: keyType as any, key }))
+            break
+          } catch (err: any) {
+            if (!u.isConnected()) throw err
+          }
+        }
+      }
+      onProgress(`读取扇区 ${s + 1}/${sectorCount}`, 5 + Math.round(((s + 1) / sectorCount) * 90))
+    }
+
+    const readCount = blocks.filter(b => b !== null).length
+    this.onLog(`读完：${readCount}/${blockCount} 块（${sectorCount} 扇区）`, 'ok')
+    return {
+      kind: 'mf1',
+      tagType: mf1TagTypeOf(blockCount),
+      blocks,
+      keys: keyMap,
+      createdAt: new Date().toISOString(),
+    }
+  }
+
+  /** Gen1a 后门卡（UID 卡/魔术卡）绕过密钥直接全卡读 */
+  async mf1Gen1aReadCard (onProgress: ProgressFn = () => {}): Promise<Mf1Dump> {
+    const u = this.ultra
+    await this.assureReader()
+    const blockCount = 256
+    const blocks: (string | null)[] = new Array(blockCount).fill(null)
+    for (let b = 0; b < blockCount; b++) {
+      try {
+        blocks[b] = hex(await u.mf1Gen1aReadBlocks(b, 1))
+      } catch (err: any) {
+        if (!u.isConnected()) throw err
+        // 4096 卡在 256 块之后会报错，1K 卡读到 64 块后报错
+        if (b >= 64 && blocks.slice(0, b).some(x => x !== null)) break
+      }
+      if (b % 16 === 0) onProgress(`Gen1a 读取 ${b}/${blockCount}`, 5 + Math.round((b / blockCount) * 90))
+    }
+    const readCount = blocks.filter(b => b !== null).length
+    if (readCount === 0) throw new Error('Gen1a 读取失败：这张卡不是后门卡，或未开启 Gen1a 模式')
+    // 找出真实块数
+    let realCount = 64
+    if (blocks.slice(128).some(x => x !== null)) realCount = 256
+    else if (blocks.slice(64, 128).some(x => x !== null)) realCount = 128
+    this.onLog(`Gen1a 读完：${readCount} 块`, 'ok')
+    return {
+      kind: 'mf1',
+      tagType: mf1TagTypeOf(realCount),
+      blocks: blocks.slice(0, realCount),
+      keys: {},
+      createdAt: new Date().toISOString(),
+    }
+  }
+
+  /** 读 Mifare Ultralight / NTAG */
+  async mfuReadCard (onProgress: ProgressFn = () => {}): Promise<MfuDump> {
+    const u = this.ultra
+    await this.assureReader()
+    onProgress('读取 MF0/NTAG…', 20)
+    const dump = await u.mfuReadDump()
+    if (dump.length === 0) throw new Error('MF0 读取失败：不是 Ultralight/NTAG 卡？')
+    onProgress('完成', 100)
+    this.onLog(`MF0 dump ${dump.length} 字节（${dump.length / 4} 页）`, 'ok')
+    return {
+      kind: 'mfu',
+      tagType: TagType.NTAG_215,
+      data: hex(dump),
+      createdAt: new Date().toISOString(),
+    }
+  }
+
+  /** LF 扫描：依次试 EM410x / HID Prox / Viking（没卡会超时，属正常） */
+  async scanLf (onProgress: ProgressFn = () => {}): Promise<LfScan[]> {
+    const u = this.ultra
+    await this.assureReader()
+    const out: LfScan[] = []
+
+    onProgress('LF：试 EM410x…', 20)
+    try {
+      const r = await u.cmdEm410xScan()
+      out.push({ kind: 'em410x', type: TagType[r.tagType] ?? 'EM410X', tagType: r.tagType, id: hex(r.id), raw: r })
+      this.onLog(`EM410x: ${hex(r.id)}`, 'ok')
+    } catch (err: any) {
+      if (!u.isConnected()) throw err
+      this.onLog(`EM410x 未检到：${err?.message ?? err}`, 'debug')
+    }
+
+    onProgress('LF：试 HID Prox…', 50)
+    try {
+      const t = await u.cmdHidProxScan()
+      out.push({ kind: 'hidprox', type: 'HID Prox', tagType: TagType.HIDProx, id: `FC ${t.fc} / CN ${t.cn} / IL ${t.il}`, raw: t })
+      this.onLog(`HID Prox: FC ${t.fc} CN ${t.cn}`, 'ok')
+    } catch (err: any) {
+      if (!u.isConnected()) throw err
+      this.onLog(`HID Prox 未检到：${err?.message ?? err}`, 'debug')
+    }
+
+    onProgress('LF：试 Viking…', 80)
+    try {
+      const v = await u.cmdVikingScan()
+      if (v.length > 0) {
+        out.push({ kind: 'viking', type: 'Viking', tagType: TagType.Viking, id: hex(v), raw: v })
+        this.onLog(`Viking: ${hex(v)}`, 'ok')
+      }
+    } catch (err: any) {
+      if (!u.isConnected()) throw err
+      this.onLog(`Viking 未检到：${err?.message ?? err}`, 'debug')
+    }
+    return out
+  }
+
+  /** 把扫到的 LF 卡号写入槽位当模拟卡 */
+  async writeLfToSlot (slot: number, scan: LfScan, onProgress: ProgressFn = () => {}): Promise<void> {
+    const u = this.ultra
+    onProgress(`切换到槽位 ${slot + 1}`, 10)
+    await u.cmdSlotSetActive(slot as Slot)
+    await u.cmdSlotChangeTagType(slot as Slot, scan.tagType)
+    onProgress('写入 LF 模拟 ID', 50)
+    if (scan.kind === 'hidprox') {
+      await u.cmdHidProxSetEmu(scan.raw)
+    } else if (scan.kind === 'viking') {
+      await u.cmdVikingSetEmuId(scan.raw)
+    } else {
+      await u.cmdEm410xSetEmuId(scan.raw)
+    }
+    onProgress('保存设置', 90)
+    await this.saveSlotSettings()
+    this.slots = await this.readSlots()
+    this.info.activeSlot = slot
+    onProgress('完成', 100)
+  }
+
+  /** 把 MF1 dump 写进某个槽位当模拟卡用 */
+  async writeMf1ToSlot (slot: number, dump: Mf1Dump, onProgress: ProgressFn = () => {}): Promise<void> {
+    const u = this.ultra
+    const blocks = dump.blocks.map(b => (b ? Buffer.from(b, 'hex') : Buffer.alloc(16)))
+    const tagType = mf1TagTypeOf(blocks.length)
+    onProgress(`切换到槽位 ${slot + 1}`, 5)
+    await u.cmdSlotSetActive(slot as Slot)
+    await u.cmdSlotChangeTagType(slot as Slot, tagType)
+    await u.cmdSlotResetTagType(slot as Slot, tagType)
+    const CHUNK = 32
+    for (let i = 0; i < blocks.length; i += CHUNK) {
+      const chunk = Buffer.concat(blocks.slice(i, i + CHUNK))
+      await u.cmdMf1EmuWriteBlock(i, chunk)
+      onProgress(`写入块 ${i}–${Math.min(i + CHUNK, blocks.length) - 1}`, 5 + Math.round((i / blocks.length) * 80))
+    }
+    // UID / ATQA / SAK 不在块 0 里，必须单独写防冲突数据（固件默认 use_mf1_coll_res=false）
+    if (dump.scan) {
+      try {
+        const uid = Buffer.from(dump.scan.uid, 'hex')
+        if ([4, 7, 10].includes(uid.length)) {
+          await u.cmdHf14aSetAntiCollData({
+            uid,
+            atqa: Buffer.from(dump.scan.atqa, 'hex'),
+            sak: Buffer.from(dump.scan.sak, 'hex'),
+            ats: dump.scan.ats ? Buffer.from(dump.scan.ats, 'hex') : undefined,
+          })
+          this.onLog('已写入 UID/ATQA/SAK', 'ok')
+        }
+      } catch (err: any) {
+        this.onLog(`写防冲突数据失败：${err?.message ?? err}`, 'warn')
+      }
+    }
+    onProgress('保存设置', 95)
+    await this.saveSlotSettings()
+    this.slots = await this.readSlots()
+    this.info.activeSlot = slot
+    onProgress('完成', 100)
+  }
+
+  /** 把 MF0 dump 写进槽位 */
+  async writeMfuToSlot (slot: number, dump: MfuDump, tagType: TagType, onProgress: ProgressFn = () => {}): Promise<void> {
+    const u = this.ultra
+    onProgress(`切换到槽位 ${slot + 1}`, 10)
+    await u.cmdSlotSetActive(slot as Slot)
+    await u.cmdSlotChangeTagType(slot as Slot, tagType)
+    await u.cmdSlotResetTagType(slot as Slot, tagType)
+    onProgress('写入页数据', 50)
+    await u.mfuWriteEmuDump(Buffer.from(dump.data, 'hex'))
+    if (dump.scan) {
+      try {
+        const uid = Buffer.from(dump.scan.uid, 'hex')
+        if ([4, 7, 10].includes(uid.length)) {
+          await u.cmdHf14aSetAntiCollData({
+            uid,
+            atqa: Buffer.from(dump.scan.atqa, 'hex'),
+            sak: Buffer.from(dump.scan.sak, 'hex'),
+          })
+        }
+      } catch (err: any) {
+        this.onLog(`写防冲突数据失败：${err?.message ?? err}`, 'warn')
+      }
+    }
+    onProgress('保存设置', 90)
+    await this.saveSlotSettings()
+    this.slots = await this.readSlots()
+    this.info.activeSlot = slot
+    onProgress('完成', 100)
+  }
+}
+
+/** 常用 MF1 密钥字典 */
+export const DEFAULT_KEYS: string[] = [
+  'FFFFFFFFFFFF', '000000000000', 'A0A1A2A3A4A5', 'D3F7D3F7D3F7',
+  '4D3A99C351DD', '1A982C7E459A', 'AABBCCDDEEFF', '714C5C886E97',
+  '587EE5F9350F', 'A0478CC39091', '533CB6C723F6', '8FD0A4F256E9',
+  'B0B1B2B3B4B5', '000000000001', 'A0A1A2A3A4A6', 'AAFFFFFFFFFFFF',
+  '5C8FF9990DA2', 'D01AFEEB890A', '75CCB59C9BED', '010203040506',
+  '123456789012', 'ABCDEF123456', '0A0B0C0D0E0F', 'BABECAFEBABE',
+  '44464952455A', 'CAFEBABE0000', '3456789ABCDE', '998877665544',
+  'A64598765432', 'FC00018778F7', '0297927C0F77', '5A7A7D7B7C7D',
+]
+
+export const LF_TAG_TYPE_OPTIONS: TagType[] = [
+  TagType.UNDEFINED,
+  TagType.EM410X,
+  TagType.EM410X_16,
+  TagType.EM410X_32,
+  TagType.EM410X_64,
+  TagType.EM410X_ELECTRA,
+  TagType.Viking,
+  TagType.HIDProx,
+]
+
+export const HF_TAG_TYPE_OPTIONS: TagType[] = [
+  TagType.UNDEFINED,
+  TagType.MIFARE_Mini,
+  TagType.MIFARE_1024,
+  TagType.MIFARE_2048,
+  TagType.MIFARE_4096,
+  TagType.MF0_ICU1,
+  TagType.MF0_ICU2,
+  TagType.MF0_UL11,
+  TagType.MF0_UL21,
+  TagType.NTAG_210,
+  TagType.NTAG_212,
+  TagType.NTAG_213,
+  TagType.NTAG_215,
+  TagType.NTAG_216,
+]
