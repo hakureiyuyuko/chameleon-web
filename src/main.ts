@@ -209,8 +209,9 @@ function renderSlots (): void {
       sel.addEventListener('change', async ev => {
         ev.stopPropagation()
         const tagType = Number(sel.value)
+        const freq = sel.dataset.freq === 'hf' ? FreqType.HF : FreqType.LF
         await run('修改类型', async () => {
-          await svc.setSlotTagType(slot, tagType)
+          await svc.setSlotTagType(slot, tagType, freq)
           renderSlots()
         })
       })

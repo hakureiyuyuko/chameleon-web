@@ -279,15 +279,21 @@ export class UltraService {
     this.onLog(`激活槽位 ${slot + 1}`, 'ok')
   }
 
-  async setSlotTagType (slot: number, tagType: TagType): Promise<void> {
-    await this.ultra.cmdSlotChangeTagType(slot as Slot, tagType)
-    this.onLog(`槽位 ${slot + 1} 类型 → ${TagType[tagType]}`, 'ok')
+  /** 改槽位类型；选 UNDEFINED 等于清空，必须用 DELETE_SLOT_SENSE_TYPE，SET_SLOT_TAG_TYPE 会报 invalid param */
+  async setSlotTagType (slot: number, tagType: TagType, freq: FreqType = FreqType.HF): Promise<void> {
+    if (tagType === TagType.UNDEFINED) {
+      await this.ultra.cmdSlotDeleteFreqType(slot as Slot, freq)
+      this.onLog(`槽位 ${slot + 1} ${freq === FreqType.HF ? 'HF' : 'LF'} 已清空`, 'ok')
+    } else {
+      await this.ultra.cmdSlotChangeTagType(slot as Slot, tagType)
+      this.onLog(`槽位 ${slot + 1} 类型 → ${TagType[tagType]}`, 'ok')
+    }
     this.slots = await this.readSlots()
   }
 
   /** @deprecated 用 setSlotTagType，tagType 自己决定是 HF 还是 LF */
   async setSlotHfTagType (slot: number, tagType: TagType): Promise<void> {
-    await this.setSlotTagType(slot, tagType)
+    await this.setSlotTagType(slot, tagType, FreqType.HF)
   }
 
   async setSlotEnable (slot: number, freq: FreqType, enable: boolean): Promise<void> {

@@ -67,6 +67,7 @@ Windows 上也可以直接双击 `start.cmd`：没有 `dist/` 会先构建，然
    - 需要完整密钥才能克隆普通卡时，勾选「同时爆破 KEY_B」（每扇区多一次全字典爆破）
 9. **连续认证失败会让卡丢场。** 大量错误密钥后固件会报 `HF tag not found`，这种是瞬时错误，读块和查密钥都带一次重试。
 10. **LF 模拟只接受 `EM410X(100)` 和 `EM410X_ELECTRA(104)`。** 固件 `get_active_em410x_type()` 对其他类型一律返回 `invalid param`（400 错误）。而 SDK 的 `cmdEm410xScan()` 在响应为 5 字节时会硬编码返回 `EM410X_64(103)`，这是 T55xx 写卡的格式、不能用于模拟。所以写槽位时要把 16/32/64 映射回 `EM410X`，并且 `cmdEm410xSetEmuId()` 要传 5 字节 Buffer（不是 scan 返回的对象）。
+11. **清空槽位类型不能用 `SET_SLOT_TAG_TYPE(UNDEFINED)`。** 实测同样返回 `invalid param`，必须走 `DELETE_SLOT_SENSE_TYPE(1024)` 并指定频率（HF/LF）。
 
 ## 已知限制
 
