@@ -142,6 +142,7 @@ async function run<T> (label: string, fn: () => Promise<T>): Promise<T | undefin
 function renderInfo (): void {
   const i = svc.info
   const parts: string[] = []
+  if (svc.portLabel) parts.push(`端口 <b>${svc.portLabel}</b>`)
   if (i.model) parts.push(`型号 <b>${i.model}</b>`)
   if (i.appVersion) parts.push(`固件 <b>${i.appVersion}</b>`)
   if (i.gitVersion) parts.push(`git <b>${i.gitVersion.slice(0, 7)}</b>`)
@@ -161,7 +162,7 @@ async function doConnect (): Promise<void> {
     return
   }
   await run('连接', async () => {
-    setProgress('等待选择串口（选 COM38）…', 30)
+    setProgress('等待选择串口…', 30)
     await svc.connect()
     setProgress('读取设备信息…', 80)
     renderInfo()
@@ -650,7 +651,7 @@ renderInfo()
 renderSlots()
 fillWriteSlotSelect()
 refreshButtons()
-addLog('页面就绪。点「连接设备」→ 在弹窗里选 COM38。', 'info')
+addLog('页面就绪。点「连接设备」，在弹出框里选择 Chameleon 的串口（Windows 上是 COMx，Linux/macOS 是 /dev/ttyACM*）。', 'info')
 void svc.ensureInit().then(() => {
   addLog('SDK 适配器已就绪（Web Serial）', 'debug')
 }).catch((err: any) => {

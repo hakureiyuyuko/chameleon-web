@@ -3,7 +3,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Deploy](https://github.com/hakureiyuyuko/chameleon-web/actions/workflows/deploy.yml/badge.svg)](https://github.com/hakureiyuyuko/chameleon-web/actions/workflows/deploy.yml)
 
-Chameleon Ultra 的**纯前端**网页版 GUI：浏览器通过 **Web Serial** 直接打开设备的 USB CDC 串口（`VID_6868&PID_8686`，Windows 上通常显示为 `COM38`），不用装任何客户端。
+Chameleon Ultra 的**纯前端**网页版 GUI：浏览器通过 **Web Serial** 直接打开设备的 USB CDC 串口（`VID_6868&PID_8686`，Windows 上是 `COMx`，Linux/macOS 是 `/dev/ttyACM*`），不用装任何客户端。
 
 在线使用：**https://hakureiyuyuko.github.io/chameleon-web/**
 

@@ -83,7 +83,7 @@ export const SLOT_COUNT = 8
 
 /** 把串口层的报错换成能直接操作的中文提示 */
 function friendlySerialError (msg: string): string {
-  if (/No port selected by the user/i.test(msg)) return '你取消了端口选择，再点一次「连接设备」并选 COM38'
+  if (/No port selected by the user/i.test(msg)) return '你取消了端口选择，再点一次「连接设备」并选择你的串口'
   if (/Failed to open serial port|Access denied|Permission denied|Failed to execute 'open'/i.test(msg)) {
     return `${msg} —— 这个串口被占用了，先关掉 chameleon-cli、桌面版 GUI 或其他串口工具`
   }
@@ -127,6 +127,8 @@ export class UltraService {
   ultra = new ChameleonUltra()
   info: DeviceInfo = {}
   slots: SlotInfo[] = []
+  /** 实际选中的串口标识，如 USB 6868:8686（端口号每台机器都可能不一样） */
+  portLabel: string | undefined
   onLog: LogFn = () => {}
 
   #initPromise?: Promise<void>
@@ -178,6 +180,17 @@ export class UltraService {
     const orig = serial.requestPort.bind(serial)
     serial.requestPort = async () => {
       const port = await orig()
+      if (port) {
+        try {
+          const info = await port.getInfo?.()
+          if (info?.usbVendorId != null) {
+            const u16 = (n: number): string => n.toString(16).padStart(4, '0').toUpperCase()
+            this.portLabel = `USB ${u16(info.usbVendorId)}:${u16(info.usbProductId ?? 0)}`
+          } else {
+            this.portLabel = '串口'
+          }
+        } catch {}
+      }
       if (port && !port.__buffered) {
         const origOpen = port.open.bind(port)
         port.open = async (opts: any = {}) => {
@@ -204,7 +217,7 @@ export class UltraService {
     } catch (err: any) {
       throw new Error(friendlySerialError(err?.message ?? String(err)))
     }
-    this.onLog('串口已打开', 'ok')
+    this.onLog(`串口已打开${this.portLabel ? `（${this.portLabel}）` : ''}`, 'ok')
     this.info = await this.readInfo()
     this.slots = await this.readSlots()
     return this.info
