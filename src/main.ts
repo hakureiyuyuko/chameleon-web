@@ -235,8 +235,11 @@ function slotHtml (s: SlotInfo): string {
   const hfOptions = HF_TAG_TYPE_OPTIONS.map(t =>
     `<option value="${t}"${t === s.hfTagType ? ' selected' : ''}>${tagTypeName(t)}</option>`,
   ).join('')
-  const lfOptions = LF_TAG_TYPE_OPTIONS.map(t =>
-    `<option value="${t}"${t === s.lfTagType ? ' selected' : ''}>${tagTypeName(t)}</option>`,
+  const lfList = LF_TAG_TYPE_OPTIONS.includes(s.lfTagType)
+    ? LF_TAG_TYPE_OPTIONS
+    : [s.lfTagType, ...LF_TAG_TYPE_OPTIONS] // 设备里存的旧类型也要能显示出来
+  const lfOptions = lfList.map(t =>
+    `<option value="${t}"${t === s.lfTagType ? ' selected' : ''}>${tagTypeName(t)}${LF_TAG_TYPE_OPTIONS.includes(t) ? '' : '（不可模拟）'}</option>`,
   ).join('')
   return `
     <div class="slot${active ? ' active' : ''}" data-slot="${s.slot}">

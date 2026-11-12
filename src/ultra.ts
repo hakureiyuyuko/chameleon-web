@@ -589,17 +589,29 @@ export class UltraService {
   /** 把扫到的 LF 卡号写入槽位当模拟卡 */
   async writeLfToSlot (slot: number, scan: LfScan, onProgress: ProgressFn = () => {}): Promise<void> {
     const u = this.ultra
+
+    // 参数先校验，别把无效值发给设备
+    if (scan.kind === 'em410x') {
+      const len = scan.id.length / 2
+      if (![5, 13].includes(len)) throw new Error(`EM410x ID 长度应为 5 或 13 字节，实际 ${len} 字节（${scan.id}）`)
+    }
+
     onProgress(`切换到槽位 ${slot + 1}`, 10)
     await u.cmdSlotSetActive(slot as Slot)
-    await u.cmdSlotChangeTagType(slot as Slot, scan.tagType)
+    const emuType = scan.kind === 'em410x' ? lfEmuTagTypeOf(scan.tagType) : scan.tagType
+    await u.cmdSlotChangeTagType(slot as Slot, emuType)
+    this.onLog(`槽位 ${slot + 1} LF 类型 → ${TagType[emuType]}`, 'info')
+
     onProgress('写入 LF 模拟 ID', 50)
     if (scan.kind === 'hidprox') {
       await u.cmdHidProxSetEmu(scan.raw)
     } else if (scan.kind === 'viking') {
-      await u.cmdVikingSetEmuId(scan.raw)
+      await u.cmdVikingSetEmuId(Buffer.from(scan.id, 'hex'))
     } else {
-      await u.cmdEm410xSetEmuId(scan.raw)
+      // 注意：这里必须传 Buffer，不能传扫描结果的整个对象
+      await u.cmdEm410xSetEmuId(Buffer.from(scan.id, 'hex'))
     }
+
     onProgress('保存设置', 90)
     await this.saveSlotSettings()
     this.slots = await this.readSlots()
@@ -689,12 +701,20 @@ export const DEFAULT_KEYS: string[] = [
   'A64598765432', 'FC00018778F7', '0297927C0F77', '5A7A7D7B7C7D',
 ]
 
+/**
+ * LF 模拟只能用得到固件认可的类型。
+ * 固件 get_active_em410x_type() 只接受 TAG_TYPE_EM410X(100) 和 TAG_TYPE_EM410X_ELECTRA(104)，
+ * EM410X_16/32/64 是 T55xx 写卡格式，拿来模拟会直接返回 invalid param。
+ */
+export function lfEmuTagTypeOf (t: TagType): TagType {
+  if (t === TagType.EM410X_ELECTRA) return TagType.EM410X_ELECTRA
+  if (t === TagType.EM410X || t === TagType.EM410X_16 || t === TagType.EM410X_32 || t === TagType.EM410X_64) return TagType.EM410X
+  return t
+}
+
 export const LF_TAG_TYPE_OPTIONS: TagType[] = [
   TagType.UNDEFINED,
   TagType.EM410X,
-  TagType.EM410X_16,
-  TagType.EM410X_32,
-  TagType.EM410X_64,
   TagType.EM410X_ELECTRA,
   TagType.Viking,
   TagType.HIDProx,
